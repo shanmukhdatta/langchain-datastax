@@ -8,6 +8,7 @@ import logging
 import uuid
 import warnings
 from concurrent.futures import ThreadPoolExecutor
+from itertools import islice
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -64,7 +65,14 @@ except ImportError:
     pass
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterable, Awaitable, Callable, Iterable, Sequence
+    from collections.abc import (
+        AsyncIterable,
+        Awaitable,
+        Callable,
+        Iterable,
+        Iterator,
+        Sequence,
+    )
 
     from astrapy.api_options import APIOptions
     from astrapy.authentication import (
@@ -156,6 +164,52 @@ def _unique_list(lst: list[T], key: Callable[[T], U]) -> list[T]:
             visited_keys.add(item_key)
             new_lst.append(item)
     return new_lst
+
+
+def _iter_add_texts_batches(
+    texts: Iterable[str],
+    metadatas: Iterable[dict] | None,
+    ids: Iterable[str | None] | None,
+    batch_size: int,
+) -> Iterator[tuple[list[str], list[dict] | None, list[str | None] | None]]:
+    """Yield aligned, bounded batches, including from one-shot iterators."""
+    if batch_size < 1:
+        msg = "batch_size must be a positive integer"
+        raise ValueError(msg)
+
+    texts_iterator = iter(texts)
+    metadatas_iterator = iter(metadatas) if metadatas is not None else None
+    ids_iterator = iter(ids) if ids is not None else None
+
+    while text_batch := list(islice(texts_iterator, batch_size)):
+        metadata_batch = (
+            list(islice(metadatas_iterator, len(text_batch)))
+            if metadatas_iterator is not None
+            else None
+        )
+        ids_batch = (
+            list(islice(ids_iterator, len(text_batch)))
+            if ids_iterator is not None
+            else None
+        )
+        if metadata_batch is not None and len(metadata_batch) != len(text_batch):
+            msg = "metadatas must have the same number of entries as texts"
+            raise ValueError(msg)
+        if ids_batch is not None and len(ids_batch) != len(text_batch):
+            msg = "ids must have the same number of entries as texts"
+            raise ValueError(msg)
+        yield text_batch, metadata_batch, ids_batch
+
+    sentinel = object()
+    if (
+        metadatas_iterator is not None
+        and next(metadatas_iterator, sentinel) is not sentinel
+    ):
+        msg = "metadatas must have the same number of entries as texts"
+        raise ValueError(msg)
+    if ids_iterator is not None and next(ids_iterator, sentinel) is not sentinel:
+        msg = "ids must have the same number of entries as texts"
+        raise ValueError(msg)
 
 
 def _normalize_content_field(
@@ -1569,6 +1623,26 @@ class AstraDBVectorStore(VectorStore):
                 "which will be ignored.",
                 stacklevel=2,
             )
+        effective_batch_size = batch_size or self.batch_size
+        if not isinstance(texts, list) or len(texts) > effective_batch_size:
+            added_ids: dict[str, None] = {}
+            for text_batch, metadata_batch, id_batch in _iter_add_texts_batches(
+                texts, metadatas, ids, effective_batch_size
+            ):
+                batch_ids = self.add_texts(
+                    text_batch,
+                    metadata_batch,
+                    id_batch,
+                    batch_size=effective_batch_size,
+                    batch_concurrency=batch_concurrency,
+                    overwrite_concurrency=overwrite_concurrency,
+                )
+                for document_id in batch_ids:
+                    # Later occurrences replace earlier ones, across batch boundaries.
+                    added_ids.pop(document_id, None)
+                    added_ids[document_id] = None
+            return list(added_ids)
+
         self.astra_env.ensure_db_setup()
 
         embedding_vectors: Sequence[list[float] | None]
@@ -1712,6 +1786,26 @@ class AstraDBVectorStore(VectorStore):
                 "which will be ignored.",
                 stacklevel=2,
             )
+        effective_batch_size = batch_size or self.batch_size
+        if not isinstance(texts, list) or len(texts) > effective_batch_size:
+            added_ids: dict[str, None] = {}
+            for text_batch, metadata_batch, id_batch in _iter_add_texts_batches(
+                texts, metadatas, ids, effective_batch_size
+            ):
+                batch_ids = await self.aadd_texts(
+                    text_batch,
+                    metadata_batch,
+                    id_batch,
+                    batch_size=effective_batch_size,
+                    batch_concurrency=batch_concurrency,
+                    overwrite_concurrency=overwrite_concurrency,
+                )
+                for document_id in batch_ids:
+                    # Later occurrences replace earlier ones, across batch boundaries.
+                    added_ids.pop(document_id, None)
+                    added_ids[document_id] = None
+            return list(added_ids)
+
         await self.astra_env.aensure_db_setup()
 
         embedding_vectors: Sequence[list[float] | None]
